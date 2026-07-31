@@ -1,0 +1,6 @@
+name: srl-vlan-groups
+topology:
+  nodes:
+    srl:
+      kind: nokia_srlinux
+      image: ghcr.io/nokia/srlinux:latest

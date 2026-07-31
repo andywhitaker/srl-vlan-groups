@@ -1,0 +1,7 @@
+vlan-groups:
+  path: /opt/vlan-groups/build_scripts
+  yang-modules:
+    names:
+      - srl_nokia-vlan-groups
+    source-directories:
+      - /opt/vlan-groups/yang

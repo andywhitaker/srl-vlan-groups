@@ -1,0 +1,106 @@
+module srl_nokia-vlan-groups {
+  yang-version 1.1;
+  namespace "urn:nokia.com:srlinux:vlan-groups:vlan-groups";
+  prefix "srl-vlan-groups";
+
+  import srl_nokia-interfaces {
+    prefix srl_nokia-if;
+  }
+  import srl_nokia-common {
+    prefix srl_nokia-comm;
+  }
+
+  description
+    "YANG model for VLAN Groups configuration.";
+
+  revision 2026-07-23 {
+    description
+      "Initial revision";
+  }
+
+  container vlan-groups {
+    description "Top level container for VLAN groups";
+
+    list group {
+      key "name";
+      description "A collection of VLANs which can be applied together to an interface.";
+
+      leaf name {
+        type string;
+        description "Name of the VLAN group";
+      }
+
+      container untagged {
+        presence "Enable untagged VLAN configuration";
+        description "Untagged VLAN configuration";
+        leaf subinterface-id {
+          type uint32;
+          default 1;
+          description "Subinterface ID to use for the untagged traffic. Defaults to 1 if not provided.";
+        }
+        leaf mac-vrf {
+          type string;
+          default "vlan-1";
+          description "Name of the MAC-VRF to associate with the untagged subinterface. Defaults to vlan-1 if not provided.";
+        }
+      }
+
+      list tag {
+        key "vlan-id";
+        description "List of tagged VLAN configurations";
+
+        leaf vlan-id {
+          type srl_nokia-comm:vlan-id;
+          description "VLAN ID";
+        }
+
+        leaf subinterface-id {
+          type uint32;
+          description "Subinterface ID to use for this VLAN tag. Defaults to <vlan-id> if not provided.";
+        }
+
+        leaf mac-vrf {
+          type string;
+          description "Name of the MAC-VRF to associate. Defaults to vlan-<vlan-id> if not provided.";
+        }
+      }
+    }
+  }
+
+  augment "/srl_nokia-if:interface" {
+    container vlan-groups {
+      presence "Enables VLAN groups on this interface";
+      description "VLAN groups configuration applied to the interface";
+
+
+
+      leaf vlan-group {
+        type leafref {
+          path "/srl-vlan-groups:vlan-groups/srl-vlan-groups:group/srl-vlan-groups:name";
+        }
+        description "Reference to the VLAN group to apply";
+      }
+
+      list per-interface-override {
+        key "vlan-id";
+        description "Per-interface override of VLAN tags within the group";
+
+        leaf vlan-id {
+          type srl_nokia-comm:vlan-id;
+          description "The VLAN ID to override";
+        }
+
+        leaf enabled {
+          type boolean;
+          default true;
+          description "Enable or disable this specific tag from the group on this interface";
+        }
+
+        leaf description {
+          type string;
+          description "Description for the overriden tag";
+        }
+      }
+    }
+  }
+}
