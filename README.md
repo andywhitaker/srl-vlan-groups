@@ -8,7 +8,7 @@ Instead of manually creating a subinterface and associating it with a MAC-VRF on
 - **Centralized VLAN Management**: Define groups of VLAN tags in a single location.
 - **Automatic Defaults**: When configuring tags, the `subinterface-id` and `mac-vrf` names are automatically derived (e.g., VLAN tag `10` creates subinterface `10` and binds to network-instance `vlan-10`).
 - **Untagged Support**: Easily manage native/untagged traffic for a group, with automatic defaults (subinterface `1`, MAC-VRF `vlan-1`).
-- **Per-Interface Overrides**: Need to prune a specific VLAN from a trunk? You can disable specific tags on a per-interface basis without modifying the core VLAN group.
+- **Operational State Tracking**: Tracks created subinterfaces and their `associated-mac-vrf` bindings directly within the SR Linux state database.
 - **Custom CLI Views**: Includes a custom `show vlan-groups` CLI plugin for clear, table-based operational views.
 - **Safe MAC-VRF Handling**: The app automatically binds interfaces to MAC-VRFs. However, it will *never* automatically delete a MAC-VRF when a group is removed, preventing accidental deletion of manually shared network-instances.
 
@@ -19,10 +19,10 @@ You define a VLAN group under the `/vlan-groups` hierarchy.
 
 ```text
 --{ candidate shared default }--[  ]--
-# set / vlan-groups group trunk-to-servers
-# set / vlan-groups group trunk-to-servers untagged
-# set / vlan-groups group trunk-to-servers tag 10
-# set / vlan-groups group trunk-to-servers tag 20
+# set / vlan-groups vlan-group trunk-to-servers
+# set / vlan-groups vlan-group trunk-to-servers untagged
+# set / vlan-groups vlan-group trunk-to-servers tag 10
+# set / vlan-groups vlan-group trunk-to-servers tag 20
 ```
 
 By default, the above configuration will:
@@ -32,7 +32,7 @@ By default, the above configuration will:
 
 You can override these defaults if desired:
 ```text
-# set / vlan-groups group trunk-to-servers tag 10 subinterface-id 100 mac-vrf my-custom-vrf
+# set / vlan-groups vlan-group trunk-to-servers tag 10 subinterface-id 100 mac-vrf my-custom-vrf
 ```
 
 ### 2. Applying a VLAN Group to an Interface
@@ -43,14 +43,6 @@ To enable the VLAN group on an interface, simply reference the group name. The a
 # set / interface ethernet-1/1 vlan-groups vlan-group trunk-to-servers
 ```
 
-### 3. Per-Interface Overrides
-If you want to apply a group to an interface but disable a specific VLAN (pruning), you can use a per-interface override:
-
-```text
---{ candidate shared default }--[  ]--
-# set / interface ethernet-1/1 vlan-groups per-interface-override vlan-id 20 enabled false
-```
-
 ## Operational Commands
 
 The application provides native SR Linux `show` commands to view the state of your VLAN groups and interfaces. Tab-completion is fully supported for group and interface names.
@@ -59,6 +51,13 @@ The application provides native SR Linux `show` commands to view the state of yo
 * `show vlan-groups group <name>` - Displays information for a specific VLAN group.
 * `show vlan-groups interface` - Displays all interfaces managed by VLAN groups and their active subinterfaces.
 * `show vlan-groups interface <name>` - Displays VLAN group mappings for a specific interface.
+
+To inspect the state database entries created by the application directly:
+```text
+--{ + state }--[  ]--
+# info / interface ethernet-1/1 vlan-groups
+# info / vlan-groups
+```
 
 ## Building and Packaging
 

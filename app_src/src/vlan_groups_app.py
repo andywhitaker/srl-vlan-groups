@@ -1,310 +1,492 @@
+#!/usr/bin/env python3
 import sys
-import time
-import logging
+import os
 import json
+import logging
 import grpc
-import threading
-import re
-import traceback
 
 sys.path.append('/opt/vlan-groups/src/vendor')
 
-from ndk import sdk_service_pb2, sdk_service_pb2_grpc
-from ndk import telemetry_service_pb2, telemetry_service_pb2_grpc
-from ndk import config_service_pb2, config_service_pb2_grpc
-import gnmi.gnmi_pb2 as gnmi_pb2
-import gnmi.gnmi_pb2_grpc as gnmi_pb2_grpc
+from ndk import sdk_service_pb2
+from ndk import sdk_service_pb2_grpc
+from ndk import config_service_pb2
+from ndk import config_service_pb2_grpc
+from ndk import telemetry_service_pb2
+from ndk import telemetry_service_pb2_grpc
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger('vlan-groups')
 
-def parse_path(path_str):
-    path = gnmi_pb2.Path()
-    pattern = r'/([^/\[]+)(?:\[([^=]+)=([^\]]+)\])?'
-    for match in re.finditer(pattern, path_str if path_str.startswith('/') else '/' + path_str):
-        name = match.group(1)
-        keys = {match.group(2): match.group(3)} if match.group(2) else {}
-        path.elem.append(gnmi_pb2.PathElem(name=name, key=keys))
-    return path
-
+import time
 class VlanGroupsApp:
     def __init__(self):
-        self.sdk_channel = grpc.insecure_channel('unix:///opt/srlinux/var/run/sr_sdk_service_manager:50053')
-        self.gnmi_channel = grpc.insecure_channel('unix:///opt/srlinux/var/run/sr_grpc_server_insecure-mgmt')
+        while True:
+            self.channel = grpc.insecure_channel('unix:///opt/srlinux/var/run/sr_sdk_service_manager:50053')
+            try:
+                grpc.channel_ready_future(self.channel).result(timeout=5)
+                break
+            except Exception as e:
+                logger.info(f"Waiting for SDK manager socket... Error: {e}")
+                time.sleep(2)
+                
+        self.sdk_stub = sdk_service_pb2_grpc.SdkMgrServiceStub(self.channel)
+        self.telemetry_stub = telemetry_service_pb2_grpc.SdkMgrTelemetryServiceStub(self.channel)
+        self.notification_stub = sdk_service_pb2_grpc.SdkNotificationServiceStub(self.channel)
+        self.config_stub = config_service_pb2_grpc.SdkMgrConfigServiceStub(self.channel)
         
-        self.sdk_stub = sdk_service_pb2_grpc.SdkMgrServiceStub(self.sdk_channel)
-        self.notif_stub = sdk_service_pb2_grpc.SdkNotificationServiceStub(self.sdk_channel)
-        self.config_stub = config_service_pb2_grpc.SdkMgrConfigServiceStub(self.sdk_channel)
-        
-        self.gnmi_stub = gnmi_pb2_grpc.gNMIStub(self.gnmi_channel)
-        self.metadata = [('username', 'admin'), ('password', 'NokiaSrl1!')]
-        self.sdk_metadata = [('agent_name', 'vlan-groups')]
-
         self.agent_id = None
-        self.vlan_groups = {} 
-        self.interfaces = {}  
-        self.current_ifs = {}
-        self.current_nis = {}
+        self.vlan_groups = {}
+        self.interfaces = {}
+        self.deployed_subs = {} # Format: {if_name: {vlan_group_name: {sub_id: mac_vrf}}}
+        self.active_telemetry_paths = set()
+
 
     def register_agent(self):
-        req = sdk_service_pb2.AgentRegistrationRequest()
-        req.wait_config_ack = True
-        res = self.sdk_stub.AgentRegister(req, metadata=self.sdk_metadata)
-        self.agent_id = getattr(res, 'app_id', 0)
-        logger.info(f"Agent registered with ID: {self.agent_id}")
-
-    def gnmi_set(self, updates=None, deletes=None):
-        if not updates and not deletes:
-            return
-        
-        req = gnmi_pb2.SetRequest()
-        if deletes:
-            for p in deletes:
-                req.delete.append(parse_path(p))
-            
-        if updates:
-            for p, val in updates:
-                upd = req.update.add()
-                upd.path.CopyFrom(parse_path(p))
-                upd.val.json_ietf_val = json.dumps(val).encode('utf-8')
-            
-        try:
-            logger.info(f"Applying gNMI SetRequest")
-            self.gnmi_stub.Set(req, metadata=self.metadata)
-        except Exception as e:
-            logger.error(f"Set error: {e}")
-
-    def gnmi_get(self, path_str):
-        req = gnmi_pb2.GetRequest(
-            path=[parse_path(path_str)],
-            encoding=gnmi_pb2.JSON_IETF,
-            type=gnmi_pb2.GetRequest.CONFIG
+        req = sdk_service_pb2.AgentRegistrationRequest(
+            js_paths=['.vlan_groups', '.interface.vlan_groups']
         )
-        try:
-            res = self.gnmi_stub.Get(req, metadata=self.metadata)
-            if not res.notification:
-                return None
-            for update in res.notification[0].update:
-                return json.loads(update.val.json_ietf_val)
-        except Exception as e:
-            logger.error(f"Get error for {path_str}: {e}")
-        return None
+        res = self.sdk_stub.AgentRegister(req, metadata=[('agent_name', 'vlan-groups')])
+        self.agent_id = res.app_id
+        logger.info(f"Agent registered with ID: {res.app_id}")
+        return res.app_id
 
-    def sync_vlan_groups(self):
-        try:
-            config = self.gnmi_get('/vlan-groups')
-            if config and 'srl_nokia-vlan-groups:group' in config:
-                self.vlan_groups = {g['name']: g for g in config['srl_nokia-vlan-groups:group']}
-            elif config and 'vlan-groups:group' in config:
-                self.vlan_groups = {g['name']: g for g in config['vlan-groups:group']}
-            elif config and 'group' in config:
-                self.vlan_groups = {g['name']: g for g in config['group']}
-            else:
-                self.vlan_groups = {}
-            
-            ifs = self.gnmi_get('/interface')
-            self.interfaces = {}
-            self.current_ifs = {}
-            
-            if ifs:
-                if_list = ifs.get('srl_nokia-interfaces:interface', ifs.get('interface', []))
-                for i in if_list:
-                    self.current_ifs[i['name']] = i
-                    vg = i.get('srl_nokia-vlan-groups:vlan-groups', i.get('vlan-groups'))
-                    if vg:
-                        self.interfaces[i['name']] = vg
-            
-            nis = self.gnmi_get('/network-instance')
-            self.current_nis = {}
-            if nis:
-                ni_list = nis.get('srl_nokia-network-instance:network-instance', nis.get('network-instance', []))
-                for ni in ni_list:
-                    self.current_nis[ni['name']] = ni
+    def subscribe_config(self):
+        # Create stream
+        req = sdk_service_pb2.NotificationRegisterRequest(op=0)
+        res = self.sdk_stub.NotificationRegister(req, metadata=[('agent_name', 'vlan-groups')])
+        stream_id = res.stream_id
+        
+        # Add config subscription (inherits js_paths from AgentRegistrationRequest)
+        from ndk.config_service_pb2 import ConfigSubscriptionRequest
+        req_sub = sdk_service_pb2.NotificationRegisterRequest(
+            op=sdk_service_pb2.NotificationRegisterRequest.OPERATION_ADD_SUBSCRIPTION,
+            stream_id=stream_id,
+            config=ConfigSubscriptionRequest()
+        )
+        self.sdk_stub.NotificationRegister(req_sub, metadata=[('agent_name', 'vlan-groups')])
+        
+        logger.info(f"Registered for config notifications, stream_id: {stream_id}")
+        return stream_id
 
-            self.reconcile()
+    def sync_telemetry(self, desired_telemetry):
+        desired_paths = set(desired_telemetry.keys())
+        paths_to_delete = self.active_telemetry_paths - desired_paths
+        
+        if desired_telemetry:
+            req = telemetry_service_pb2.TelemetryUpdateRequest()
+            for path, data in desired_telemetry.items():
+                info = req.states.add()
+                info.key.js_path = path
+                info.data.json_content = data
+            try:
+                self.telemetry_stub.TelemetryAddOrUpdate(req, metadata=[('agent_name', 'vlan-groups')])
+            except Exception as e:
+                logger.error(f"Error updating telemetry: {e}")
+
+        if paths_to_delete:
+            del_req = telemetry_service_pb2.TelemetryDeleteRequest()
+            for path in paths_to_delete:
+                key = del_req.keys.add()
+                key.js_path = path
+                logger.info(f"Deleting telemetry path: {path}")
+            try:
+                self.telemetry_stub.TelemetryDelete(del_req, metadata=[('agent_name', 'vlan-groups')])
+            except Exception as e:
+                logger.error(f"Error deleting telemetry: {e}")
+                
+        self.active_telemetry_paths = desired_paths
+
+    def process_notifications(self, stream_id):
+        req = sdk_service_pb2.NotificationStreamRequest(stream_id=stream_id)
+        logger.info(f"Starting to listen on NotificationStream for stream {stream_id}")
+        try:
+            for res in self.notification_stub.NotificationStream(req, metadata=[('agent_name', 'vlan-groups')]):
+                logger.info(f"Raw notification stream response received")
+                
+                if res.notifications:
+                    logger.info(f"Received notification response with {len(res.notifications)} notifications")
+                    for notif in res.notifications:
+                        if notif.HasField('config'):
+                            self.handle_config_notification(notif.config)
+                            
+                # Ack the config ALWAYS when we receive a stream response
+                ack_req = config_service_pb2.AcknowledgeConfigRequest()
+                self.config_stub.AcknowledgeConfig(ack_req, metadata=[('agent_name', 'vlan-groups')])
+                logger.info("Acknowledged config successfully!")
+                
+                self.reconcile()
         except Exception as e:
-            logger.error(f"Error in sync_vlan_groups: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"NotificationStream loop crashed: {e}")
+            import time
+            time.sleep(2)
+        logger.error(f"NotificationStream loop EXITED normally!")
+
+    def handle_config_notification(self, config_notif):
+        path = config_notif.key.js_path
+        keys = config_notif.key.keys
+        data = config_notif.data.json
+        if data:
+            try:
+                parsed_data = json.loads(data)
+                logger.info(f"Path: {path}, Keys: {keys}, Data: {parsed_data}")
+                
+                if path == '.vlan_groups.vlan_group' and len(keys) >= 1:
+                    group_name = keys[0]
+                    if group_name not in self.vlan_groups:
+                        self.vlan_groups[group_name] = {'name': group_name}
+                    
+                    group_data = parsed_data.get('vlan_group', parsed_data)
+                    if 'untagged' in group_data:
+                        self.vlan_groups[group_name]['untagged'] = self._parse_untagged_data(group_data['untagged'])
+
+                elif path == '.vlan_groups.vlan_group.untagged' and len(keys) >= 1:
+                    group_name = keys[0]
+                    if group_name not in self.vlan_groups:
+                        self.vlan_groups[group_name] = {'name': group_name}
+                    
+                    untagged_data = parsed_data.get('untagged', parsed_data)
+                    self.vlan_groups[group_name]['untagged'] = self._parse_untagged_data(untagged_data)
+                
+                elif path == '.vlan_groups.vlan_group.tag' and len(keys) >= 2:
+                    group_name = keys[0]
+                    vlan_id = keys[1]
+                    if group_name not in self.vlan_groups:
+                        self.vlan_groups[group_name] = {'name': group_name}
+                    
+                    if 'tag' not in self.vlan_groups[group_name]:
+                        self.vlan_groups[group_name]['tag'] = []
+                    
+                    # Update or add tag
+                    tag_data = parsed_data.get('tag', {})
+                    tag_entry = {'vlan-id': int(vlan_id)}
+                    
+                    if 'subinterface_id' in tag_data and 'value' in tag_data['subinterface_id']:
+                        tag_entry['subinterface-id'] = int(tag_data['subinterface_id']['value'])
+                    if 'mac_vrf' in tag_data and 'value' in tag_data['mac_vrf']:
+                        tag_entry['mac-vrf'] = tag_data['mac_vrf']['value']
+                        
+                    # find if exists
+                    existing = False
+                    for i, t in enumerate(self.vlan_groups[group_name]['tag']):
+                        if t.get('vlan-id') == tag_entry['vlan-id']:
+                            self.vlan_groups[group_name]['tag'][i] = tag_entry
+                            existing = True
+                            break
+                    if not existing:
+                        self.vlan_groups[group_name]['tag'].append(tag_entry)
+                            
+                # Handle interface configuration
+                elif path == '.interface.vlan_groups.vlan_group' and len(keys) >= 2:
+                    if_name = keys[0]
+                    vlan_group_name = keys[1]
+                    
+                    if if_name not in self.interfaces:
+                        self.interfaces[if_name] = {'vlan-group': []}
+                    
+                    if 'vlan-group' not in self.interfaces[if_name]:
+                        self.interfaces[if_name]['vlan-group'] = []
+                        
+                    # find if exists
+                    existing = False
+                    for i, vg in enumerate(self.interfaces[if_name]['vlan-group']):
+                        if vg.get('name') == vlan_group_name:
+                            existing = True
+                            break
+                    if not existing:
+                        self.interfaces[if_name]['vlan-group'].append({'name': vlan_group_name})
+
+            except json.JSONDecodeError:
+                logger.error(f"Failed to parse JSON: {data}")
+        else:
+            # Handling deletions
+            if path == '.vlan_groups.vlan_group' and len(keys) >= 1:
+                group_name = keys[0]
+                if group_name in self.vlan_groups:
+                    del self.vlan_groups[group_name]
+            elif path == '.vlan_groups.vlan_group.untagged' and len(keys) >= 1:
+                group_name = keys[0]
+                if group_name in self.vlan_groups and 'untagged' in self.vlan_groups[group_name]:
+                    del self.vlan_groups[group_name]['untagged']
+            elif path == '.vlan_groups.vlan_group.tag' and len(keys) >= 2:
+                group_name = keys[0]
+                vlan_id = int(keys[1])
+                if group_name in self.vlan_groups and 'tag' in self.vlan_groups[group_name]:
+                    self.vlan_groups[group_name]['tag'] = [t for t in self.vlan_groups[group_name]['tag'] if t.get('vlan-id') != vlan_id]
+            elif path == '.interface.vlan_groups.vlan_group' and len(keys) >= 2:
+                if_name = keys[0]
+                vlan_group_name = keys[1]
+                if if_name in self.interfaces and 'vlan-group' in self.interfaces[if_name]:
+                    self.interfaces[if_name]['vlan-group'] = [vg for vg in self.interfaces[if_name]['vlan-group'] if vg.get('name') != vlan_group_name]
+
+    def _generate_gnmi_updates(self, if_name, group_cfg):
+        updates = []
+        desired_subs = {}
+        
+        # Determine base interface type (e.g., ethernet-1/1 or lag-1)
+        base_if = if_name
+        
+        # Handle untagged subinterface
+        if 'untagged' in group_cfg:
+            sid = group_cfg['untagged'].get('subinterface-id', 1)
+            mac_vrf = group_cfg['untagged'].get('mac-vrf', 'vlan-1')
+            
+            # Create subinterface
+            sub_path = f"/interface[name={base_if}]/subinterface[index={sid}]"
+            updates.append({
+                "path": sub_path,
+                "value": {
+                    "type": "bridged",
+                    "vlan": {
+                        "encap": {
+                            "untagged": {}
+                        }
+                    }
+                }
+            })
+            
+            # Associate with MAC-VRF
+            updates.append({
+                "path": f"/network-instance[name={mac_vrf}]",
+                "value": {
+                    "type": "mac-vrf"
+                }
+            })
+            ni_path = f"/network-instance[name={mac_vrf}]/interface[name={base_if}.{sid}]"
+            updates.append({
+                "path": ni_path,
+                "value": {}
+            })
+            desired_subs[sid] = mac_vrf
+
+        # Handle tagged subinterfaces
+        for tag in group_cfg.get('tag', []):
+            vid = tag['vlan-id']
+            sid = tag.get('subinterface-id', vid)
+            mac_vrf = tag.get('mac-vrf', f'vlan-{vid}')
+            
+            # Create subinterface
+            sub_path = f"/interface[name={base_if}]/subinterface[index={sid}]"
+            updates.append({
+                "path": sub_path,
+                "value": {
+                    "type": "bridged",
+                    "vlan": {
+                        "encap": {
+                            "single-tagged": {
+                                "vlan-id": vid
+                            }
+                        }
+                    }
+                }
+            })
+            
+            # Associate with MAC-VRF
+            updates.append({
+                "path": f"/network-instance[name={mac_vrf}]",
+                "value": {
+                    "type": "mac-vrf"
+                }
+            })
+            ni_path = f"/network-instance[name={mac_vrf}]/interface[name={base_if}.{sid}]"
+            updates.append({
+                "path": ni_path,
+                "value": {}
+            })
+            desired_subs[sid] = mac_vrf
+            
+        return updates, desired_subs
+
 
     def reconcile(self):
         updates = []
-        deletes_ni = []
-        deletes_if = []
+        deletes = []
         
-        # Track desired subinterfaces per interface
         desired_subs = {}
+        group_interfaces = {}
+
+        for if_name, if_cfg in self.interfaces.items():
+            if 'vlan-group' in if_cfg:
+                for vg in if_cfg['vlan-group']:
+                    g_name = vg['name']
+                    if g_name in self.vlan_groups:
+                        if g_name not in group_interfaces:
+                            group_interfaces[g_name] = []
+                        group_interfaces[g_name].append(if_name)
+                        
+                        upds, subs = self._generate_gnmi_updates(if_name, self.vlan_groups[g_name])
+                        updates.extend(upds)
+                        
+                        if if_name not in desired_subs:
+                            desired_subs[if_name] = {}
+                        if g_name not in desired_subs[if_name]:
+                            desired_subs[if_name][g_name] = {}
+                        desired_subs[if_name][g_name].update(subs)
+
+        # Compute Deletions
+        for if_name, deployed_vgs in self.deployed_subs.items():
+            for vg_name, deployed_sub_map in deployed_vgs.items():
+                for sid, mac_vrf in deployed_sub_map.items():
+                    # Check if this subinterface should still exist for this interface/group
+                    if if_name not in desired_subs or vg_name not in desired_subs[if_name] or sid not in desired_subs[if_name][vg_name]:
+                        base_if = if_name
+                        deletes.append(f"/network-instance[name={mac_vrf}]/interface[name={base_if}.{sid}]")
+                        deletes.append(f"/interface[name={base_if}]/subinterface[index={sid}]")
         
-        for if_name, if_group_cfg in self.interfaces.items():
-            group_name = if_group_cfg.get('vlan-group')
-            if not group_name or group_name not in self.vlan_groups:
-                continue
-                
-            desired_subs[if_name] = {}
-            
-            curr_if = self.current_ifs.get(if_name, {})
-            if not curr_if.get('vlan-tagging'):
-                updates.append((f'/interface[name={if_name}]', {'vlan-tagging': True}))
-            
-            group = self.vlan_groups[group_name]
-            overrides = {o['vlan-id']: o for o in if_group_cfg.get('per-interface-override', [])}
-            
-            if 'untagged' in group:
-                sub_id = group['untagged'].get('subinterface-id', 1)
-                mac_vrf = group['untagged'].get('mac-vrf', 'vlan-1')
-                desired_subs[if_name][str(sub_id)] = mac_vrf
-                self.apply_subinterface(updates, curr_if, if_name, sub_id, mac_vrf, untagged=True)
-                
-            for tag in group.get('tag', []):
-                vid = tag['vlan-id']
-                if vid in overrides and not overrides[vid].get('enabled', True):
-                    continue
-                
-                sub_id = tag.get('subinterface-id', vid)
-                mac_vrf = tag.get('mac-vrf', f'vlan-{vid}')
-                desired_subs[if_name][str(sub_id)] = mac_vrf
-                self.apply_subinterface(updates, curr_if, if_name, sub_id, mac_vrf, vlan_id=vid)
+        # Update our memory
+        self.deployed_subs = desired_subs
 
-        # Cleanup pass
-        for if_name, curr_if in self.current_ifs.items():
-            if_desired = desired_subs.get(if_name, {})
-            for s in curr_if.get('subinterface', []):
-                if s.get('description') == 'vlan-groups-managed':
-                    sid = str(s.get('index'))
-                    if sid not in if_desired:
-                        deletes_if.append(f'/interface[name={if_name}]/subinterface[index={sid}]')
-                        # Remove interface from mac-vrf
-                        for ni_name, curr_ni in self.current_nis.items():
-                            if 'mac-vrf' in curr_ni.get('type', ''):
-                                for ni_if in curr_ni.get('interface', []):
-                                    if ni_if.get('name') == f'{if_name}.{sid}':
-                                        deletes_ni.append(f'/network-instance[name={ni_name}]/interface[name={if_name}.{sid}]')
+        # Execute gNMI updates and deletes
+        if updates or deletes:
+            logger.info(f"Applying {len(updates)} updates, {len(deletes)} deletes via gNMI")
+            self._apply_gnmi(updates, deletes)
+            
+        # Update Telemetry State
+        desired_telemetry = {}
+        for g_name, group_cfg in self.vlan_groups.items():
+            # Mirror the untagged configuration
+            group_data = {}
+            if 'untagged' in group_cfg:
+                group_data['untagged'] = self._clean_ndk_json(group_cfg['untagged'])
+            if group_data:
+                desired_telemetry[f'.vlan_groups.vlan_group{{.name=="{g_name}"}}'] = json.dumps(group_data)
 
-        if updates or deletes_ni or deletes_if:
-            logger.info(f"Applying {len(updates)} updates, {len(deletes_ni)} NI deletes, {len(deletes_if)} IF deletes via gNMI")
-            if deletes_ni:
-                self.gnmi_set(deletes=deletes_ni)
-            if deletes_if:
-                self.gnmi_set(deletes=deletes_if)
+            # Mirror the tag configuration
+            if 'tag' in group_cfg and group_cfg['tag']:
+                for tag_data in group_cfg['tag']:
+                    tag_id = tag_data.get('vlan-id')
+                    if tag_id is not None:
+                        clean_tag = self._clean_ndk_json(tag_data)
+                        desired_telemetry[f'.vlan_groups.vlan_group{{.name=="{g_name}"}}.tag{{.vlan-id=="{tag_id}"}}'] = json.dumps(clean_tag)
+
+            # Mirror applied interfaces
+            if g_name in group_interfaces:
+                for if_name in group_interfaces[g_name]:
+                    desired_telemetry[f'.vlan_groups.vlan_group{{.name=="{g_name}"}}.applied.interfaces.interface{{.name=="{if_name}"}}'] = "{}"
+            
+            # Mirror created network-instances
+            created_mvrfs = set()
+            if 'untagged' in group_cfg:
+                val = group_cfg['untagged'].get('mac-vrf', 'vlan-1')
+                if isinstance(val, dict):
+                    val = val.get('value', 'vlan-1')
+                created_mvrfs.add(val)
+            for tag_data in group_cfg.get('tag', []):
+                vid = tag_data.get('vlan-id')
+                if isinstance(vid, dict): vid = vid.get('value')
+                val = tag_data.get('mac-vrf', f'vlan-{vid}')
+                if isinstance(val, dict): val = val.get('value', f'vlan-{vid}')
+                created_mvrfs.add(val)
+                
+            for mvrf in created_mvrfs:
+                desired_telemetry[f'.vlan_groups.vlan_group{{.name=="{g_name}"}}.created.network_instances.network_instance{{.name=="{mvrf}"}}'] = "{}"
+
+        # Mirror interface vlan-groups config and state
+        for if_name, if_cfg in self.interfaces.items():
+            if 'vlan-group' in if_cfg:
+                for vg in if_cfg['vlan-group']:
+                    vg_name = vg['name']
+                    desired_telemetry[f'.interface{{.name=="{if_name}"}}.vlan_groups.vlan_group{{.name=="{vg_name}"}}'] = "{}"
+                    if if_name in self.deployed_subs and vg_name in self.deployed_subs[if_name]:
+                        for sid, mvrf in self.deployed_subs[if_name][vg_name].items():
+                            data = {"associated-mac-vrf": mvrf}
+                            desired_telemetry[f'.interface{{.name=="{if_name}"}}.vlan_groups.vlan_group{{.name=="{vg_name}"}}.created.subinterface{{.index=={sid}}}'] = json.dumps(data)
+                
+        self.sync_telemetry(desired_telemetry)
+    def _parse_untagged_data(self, untagged_data):
+        entry = {}
+        if not isinstance(untagged_data, dict):
+            return entry
+        if 'subinterface_id' in untagged_data:
+            val = untagged_data['subinterface_id']
+            if isinstance(val, dict) and 'value' in val:
+                entry['subinterface-id'] = int(val['value'])
+            elif isinstance(val, (int, str)) and str(val).isdigit():
+                entry['subinterface-id'] = int(val)
+        elif 'subinterface-id' in untagged_data:
+            entry['subinterface-id'] = int(untagged_data['subinterface-id'])
+            
+        if 'mac_vrf' in untagged_data:
+            val = untagged_data['mac_vrf']
+            if isinstance(val, dict) and 'value' in val:
+                entry['mac-vrf'] = val['value']
+            elif isinstance(val, str):
+                entry['mac-vrf'] = val
+        elif 'mac-vrf' in untagged_data:
+            entry['mac-vrf'] = untagged_data['mac-vrf']
+            
+        return entry
+
+    def _clean_ndk_json(self, data):
+        if isinstance(data, dict):
+            if 'value' in data and len(data) == 1:
+                val = data['value']
+                if isinstance(val, str) and val.isdigit():
+                    return int(val)
+                return val
+            result = {}
+            for k, v in data.items():
+                new_key = k.replace('_', '-')
+                result[new_key] = self._clean_ndk_json(v)
+            return result
+        elif isinstance(data, list):
+            return [self._clean_ndk_json(item) for item in data]
+        else:
+            return data
+
+    def _apply_gnmi(self, updates, deletes=None):
+        if not updates and not deletes:
+            return
+            
+        import grpc
+        import json
+        import re
+        from gnmi import gnmi_pb2
+        from gnmi import gnmi_pb2_grpc
+        
+        def _parse_gnmi_path(path_str):
+            path = gnmi_pb2.Path()
+            parts = re.findall(r'([^/\[]+(?:\[[^\]]+\])?)', path_str)
+            for part in parts:
+                elem = path.elem.add()
+                if '[' in part and part.endswith(']'):
+                    name, key_val = part.split('[', 1)
+                    elem.name = name
+                    key_val = key_val[:-1]
+                    k, v = key_val.split('=', 1)
+                    elem.key[k] = v
+                else:
+                    elem.name = part
+            return path
+            
+        try:
+            channel = grpc.insecure_channel('unix:///opt/srlinux/var/run/sr_grpc_server_insecure-mgmt')
+            stub = gnmi_pb2_grpc.gNMIStub(channel)
+            
+            req = gnmi_pb2.SetRequest()
+            if deletes:
+                for d in deletes:
+                    del_path = req.delete.add()
+                    del_path.CopyFrom(_parse_gnmi_path(d))
+            
             if updates:
-                self.gnmi_set(updates=updates)
-
-    def apply_subinterface(self, updates, curr_if, if_name, sub_id, mac_vrf, untagged=False, vlan_id=None):
-        sub_path = f'/interface[name={if_name}]/subinterface[index={sub_id}]'
-        
-        # Check if subinterface already exists with correct config
-        curr_sub = None
-        for s in curr_if.get('subinterface', []):
-            if str(s.get('index')) == str(sub_id):
-                curr_sub = s
-                break
+                for u in updates:
+                    update = req.update.add()
+                    update.path.CopyFrom(_parse_gnmi_path(u["path"]))
+                    update.val.json_ietf_val = json.dumps(u["value"]).encode('utf-8')
                 
-        needs_sub_update = False
-        if not curr_sub:
-            needs_sub_update = True
-        else:
-            if 'bridged' not in curr_sub.get('type', ''): needs_sub_update = True
-            if curr_sub.get('description') != 'vlan-groups-managed': needs_sub_update = True
-            vlan_cfg = curr_sub.get('vlan', {}).get('encap', {})
-            if untagged and 'untagged' not in vlan_cfg: needs_sub_update = True
-            if vlan_id is not None:
-                st = vlan_cfg.get('single-tagged', {})
-                if str(st.get('vlan-id')) != str(vlan_id): needs_sub_update = True
-
-        if needs_sub_update:
-            sub_cfg = {
-                'index': sub_id,
-                'description': 'vlan-groups-managed',
-                'type': 'bridged',
-                'vlan': {
-                    'encap': {
-                        'untagged': {} if untagged else None,
-                        'single-tagged': {'vlan-id': vlan_id} if vlan_id is not None else None
-                    }
-                }
-            }
-            if not untagged:
-                del sub_cfg['vlan']['encap']['untagged']
-            if vlan_id is None:
-                del sub_cfg['vlan']['encap']['single-tagged']
-            updates.append((sub_path, sub_cfg))
-        
-        vrf_path = f'/network-instance[name={mac_vrf}]'
-        curr_ni = self.current_nis.get(mac_vrf)
-        needs_ni_update = False
-        if not curr_ni:
-            needs_ni_update = True
-        else:
-            if 'mac-vrf' not in curr_ni.get('type', ''): needs_ni_update = True
-            found_if = False
-            for i in curr_ni.get('interface', []):
-                if i.get('name') == f'{if_name}.{sub_id}':
-                    found_if = True
-                    break
-            if not found_if: needs_ni_update = True
-            
-        if needs_ni_update:
-            vrf_cfg = {
-                'name': mac_vrf,
-                'type': 'mac-vrf',
-                'interface': [{'name': f'{if_name}.{sub_id}'}]
-            }
-            updates.append((vrf_path, vrf_cfg))
-
-
-
-    def config_stream_loop(self):
-        # Create the stream first
-        req_create = sdk_service_pb2.NotificationRegisterRequest(
-            op=sdk_service_pb2.NotificationRegisterRequest.OPERATION_CREATE
-        )
-        try:
-            res_create = self.sdk_stub.NotificationRegister(req_create, metadata=self.sdk_metadata)
-            stream_id = res_create.stream_id
-            
-            # Now add the subscription
-            req_sub = sdk_service_pb2.NotificationRegisterRequest(
-                op=sdk_service_pb2.NotificationRegisterRequest.OPERATION_ADD_SUBSCRIPTION,
-                stream_id=stream_id,
-                config=config_service_pb2.ConfigSubscriptionRequest()
-            )
-            self.sdk_stub.NotificationRegister(req_sub, metadata=self.sdk_metadata)
-            
-            logger.info(f"Registered for config notifications, stream_id: {stream_id}")
-            
-            stream_req = sdk_service_pb2.NotificationStreamRequest(stream_id=stream_id)
-            for notif_resp in self.notif_stub.NotificationStream(stream_req, metadata=self.sdk_metadata):
-                logger.info(f"Received notification response with {len(notif_resp.notifications)} notifications")
-                ack_paths = []
-                for notif in notif_resp.notifications:
-                    if notif.HasField('config'):
-                        cfg_notif = notif.config
-                        path = cfg_notif.key.js_path_with_keys or cfg_notif.key.js_path
-                        if path:
-                            ack_paths.append(path)
-                
-                ack = config_service_pb2.AcknowledgeConfigRequest()
-                for p in ack_paths:
-                    info = ack.infos.add()
-                    info.js_path_with_keys = p
-                self.config_stub.AcknowledgeConfig(ack, metadata=self.sdk_metadata)
-                
-                logger.info(f"Acked {len(ack_paths)} config paths")
-                if '.commit.end' in ack_paths:
-                    self.sync_vlan_groups()
+            res = stub.Set(req, metadata=[("username", "admin"), ("password", "NokiaSrl1!")])
+            logger.info(f"gNMI update successful")
         except Exception as e:
-            logger.error(f"Config stream error: {e}")
-            logger.error(traceback.format_exc())
-
+            logger.error(f"gNMI update failed: {e}")
     def run(self):
-
-        self.register_agent()
-        threading.Thread(target=self.config_stream_loop, daemon=True).start()
+        app_id = self.register_agent()
+        stream_id = self.subscribe_config()
         
-        try:
-            while True:
-                time.sleep(5)
-        except KeyboardInterrupt:
-            logger.info("Exiting...")
+        while True:
+            self.process_notifications(stream_id)
 
 if __name__ == '__main__':
     app = VlanGroupsApp()

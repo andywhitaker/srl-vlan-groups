@@ -1,29 +1,29 @@
 module srl_nokia-vlan-groups {
   yang-version 1.1;
   namespace "urn:nokia.com:srlinux:vlan-groups:vlan-groups";
-  prefix "srl-vlan-groups";
+  prefix srl_nokia-vlan-groups;
 
-  import srl_nokia-interfaces {
-    prefix srl_nokia-if;
-  }
   import srl_nokia-common {
     prefix srl_nokia-comm;
   }
+  import srl_nokia-interfaces {
+    prefix srl_nokia-if;
+  }
 
-  description
-    "YANG model for VLAN Groups configuration.";
+  revision 2024-08-01 {
+    description "Update state hierarchy";
+  }
 
-  revision 2026-07-23 {
-    description
-      "Initial revision";
+  revision 2024-03-05 {
+    description "Initial revision";
   }
 
   container vlan-groups {
     description "Top level container for VLAN groups";
 
-    list group {
+    list vlan-group {
       key "name";
-      description "A collection of VLANs which can be applied together to an interface.";
+      description "A VLAN group";
 
       leaf name {
         type string;
@@ -56,12 +56,48 @@ module srl_nokia-vlan-groups {
 
         leaf subinterface-id {
           type uint32;
-          description "Subinterface ID to use for this VLAN tag. Defaults to <vlan-id> if not provided.";
+          description "Subinterface ID to use for this VLAN. Defaults to the VLAN ID if not provided.";
         }
 
         leaf mac-vrf {
           type string;
-          description "Name of the MAC-VRF to associate. Defaults to vlan-<vlan-id> if not provided.";
+          description "Name of the MAC-VRF to associate with this subinterface. Defaults to vlan-<vlan-id> if not provided.";
+        }
+      }
+
+
+
+      container applied {
+        config false;
+        description "State relating to applied interfaces";
+        
+        container interfaces {
+          list interface {
+            key "name";
+            description "List of interfaces this VLAN group is applied to";
+
+            leaf name {
+              type string;
+              description "Interface name";
+            }
+          }
+        }
+      }
+
+      container created {
+        config false;
+        description "State relating to created entities";
+
+        container network-instances {
+          list network-instance {
+            key "name";
+            description "List of network instances created by this VLAN group";
+
+            leaf name {
+              type string;
+              description "Network instance name";
+            }
+          }
         }
       }
     }
@@ -69,38 +105,39 @@ module srl_nokia-vlan-groups {
 
   augment "/srl_nokia-if:interface" {
     container vlan-groups {
-      presence "Enables VLAN groups on this interface";
-      description "VLAN groups configuration applied to the interface";
+      description "VLAN group configuration applied to this interface";
 
+      list vlan-group {
+        key "name";
+        description "VLAN group applied to this interface";
 
-
-      leaf vlan-group {
-        type leafref {
-          path "/srl-vlan-groups:vlan-groups/srl-vlan-groups:group/srl-vlan-groups:name";
-        }
-        description "Reference to the VLAN group to apply";
-      }
-
-      list per-interface-override {
-        key "vlan-id";
-        description "Per-interface override of VLAN tags within the group";
-
-        leaf vlan-id {
-          type srl_nokia-comm:vlan-id;
-          description "The VLAN ID to override";
+        leaf name {
+          type leafref {
+            path "/srl_nokia-vlan-groups:vlan-groups/srl_nokia-vlan-groups:vlan-group/srl_nokia-vlan-groups:name";
+          }
+          description "Name of the VLAN group";
         }
 
-        leaf enabled {
-          type boolean;
-          default true;
-          description "Enable or disable this specific tag from the group on this interface";
-        }
+        container created {
+          config false;
+          description "State relating to created subinterfaces";
 
-        leaf description {
-          type string;
-          description "Description for the overriden tag";
+          list subinterface {
+          key "index";
+          description "List of subinterfaces created by this VLAN group";
+
+          leaf index {
+            type uint32;
+            description "Subinterface index";
+          }
+          
+          leaf associated-mac-vrf {
+            type string;
+            description "The network-instance this subinterface is bound to";
+          }
         }
       }
     }
   }
+}
 }

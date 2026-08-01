@@ -1,5 +1,6 @@
 vlan-groups:
   path: /opt/vlan-groups/build_scripts
+  search-command: /opt/srlinux/python/virtual-env/bin/python3 /opt/vlan-groups/src/vlan_groups_app.py
   yang-modules:
     names:
       - srl_nokia-vlan-groups

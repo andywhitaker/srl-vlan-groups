@@ -44,9 +44,9 @@ class Plugin(CliPlugin):
         vg_data = {}
         if vg_json:
             vg_parsed = json.loads(vg_json)
-            group_list = vg_parsed.get('vlan_groups', {}).get('group', [])
+            group_list = vg_parsed.get('vlan_groups', {}).get('vlan_group', [])
             if not group_list:
-                group_list = vg_parsed.get('group', [])
+                group_list = vg_parsed.get('vlan_group', [])
                 
             for g in group_list:
                 name = g.get('name', {}).get('value', '')
@@ -56,7 +56,7 @@ class Plugin(CliPlugin):
                 mac_vrfs = []
                 subs = []
                 
-                inner = g.get('group', g)
+                inner = g.get('vlan_group', g)
                 
                 if 'untagged' in inner:
                     ut = inner['untagged']
@@ -90,11 +90,20 @@ class Plugin(CliPlugin):
             for i in if_list:
                 if_name = i.get('name', {}).get('value', '')
                 inner = i.get('interface', i)
-                vg = inner.get('vlan_groups', {}).get('vlan_group', {}).get('value', '')
-                if vg and vg in vg_data:
-                    vg_data[vg]['interfaces'].append(if_name)
-                if_data[if_name] = vg
+                vgs_container = inner.get('vlan_groups', {})
+                vg_list = vgs_container.get('vlan_group', [])
+                if isinstance(vg_list, dict):
+                    vg_list = [vg_list]
                 
+                vgs = []
+                for vg_item in vg_list:
+                    vg = vg_item.get('name', {}).get('value', '')
+                    if vg:
+                        vgs.append(vg)
+                        if vg in vg_data:
+                            vg_data[vg]['interfaces'].append(if_name)
+                            
+                if_data[if_name] = ", ".join(vgs) if vgs else ""
         return vg_data, if_data
 
     def _print_table(self, output, headers, widths, data_rows):
