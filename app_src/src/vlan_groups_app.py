@@ -228,6 +228,12 @@ class VlanGroupsApp:
         # Determine base interface type (e.g., ethernet-1/1 or lag-1)
         base_if = if_name
         
+        # Ensure interface has vlan-tagging enabled for subinterfaces
+        updates.append({
+            "path": f"/interface[name={base_if}]/vlan-tagging",
+            "value": True
+        })
+        
         # Handle untagged subinterface
         if 'untagged' in group_cfg:
             sid = group_cfg['untagged'].get('subinterface-id', 1)
@@ -338,10 +344,19 @@ class VlanGroupsApp:
         # Update our memory
         self.deployed_subs = desired_subs
 
-        # Execute gNMI updates and deletes
-        if updates or deletes:
-            logger.info(f"Applying {len(updates)} updates, {len(deletes)} deletes via gNMI")
-            self._apply_gnmi(updates, deletes)
+        # Separate vlan-tagging updates from subinterface updates
+        tagging_updates = [u for u in updates if u["path"].endswith("/vlan-tagging")]
+        other_updates = [u for u in updates if not u["path"].endswith("/vlan-tagging")]
+
+        # Step 1: Enable vlan-tagging on target interfaces first
+        if tagging_updates:
+            logger.info(f"Enabling vlan-tagging on {len(tagging_updates)} interfaces via gNMI")
+            self._apply_gnmi(tagging_updates)
+
+        # Step 2: Execute subinterface and network-instance updates/deletes
+        if other_updates or deletes:
+            logger.info(f"Applying {len(other_updates)} subinterface updates, {len(deletes)} deletes via gNMI")
+            self._apply_gnmi(other_updates, deletes)
             
         # Update Telemetry State
         desired_telemetry = {}
