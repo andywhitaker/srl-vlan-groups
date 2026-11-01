@@ -2,10 +2,10 @@ name: vlan-groups
 version: 0.1.0
 arch: amd64
 platform: linux
-maintainer: Antigravity
-description: VLAN Groups App
-vendor: Custom
-license: Apache 2.0
+maintainer: Andy Whitaker <32944047+andywhitaker@users.noreply.github.com>
+description: Nokia SR Linux NDK agent for centralized VLAN group management
+vendor: Nokia SR Linux Community
+license: Apache-2.0
 contents:
   - src: ./app_src/src/vlan_groups_app.py
     dst: /opt/vlan-groups/src/vlan_groups_app.py
@@ -19,10 +19,18 @@ contents:
       mode: 0755
   - src: ./app_src/yang/srl_nokia-vlan-groups.yang
     dst: /opt/vlan-groups/yang/srl_nokia-vlan-groups.yang
+    file_info:
+      mode: 0644
   - src: ./app_src/vlan-groups.yml
     dst: /etc/opt/srlinux/appmgr/vlan-groups.yml
+    file_info:
+      mode: 0644
   - src: ./app_src/cli-plugins/vlan_groups_show.py
-    # We place the CLI plugin here and link it in postinstall to avoid guessing the python version directory statically.
+    # Place the CLI plugin here and symlink it in postinstall
     dst: /opt/vlan-groups/cli-plugins/vlan_groups_show.py
+    file_info:
+      mode: 0644
 scripts:
   postinstall: ./build_scripts/postinstall.sh
+  preremove: ./build_scripts/preremove.sh
+  postremove: ./build_scripts/postremove.sh

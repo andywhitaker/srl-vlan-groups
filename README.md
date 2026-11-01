@@ -63,10 +63,14 @@ To inspect the state database entries created by the application directly:
 
 This project uses [nfpm](https://nfpm.goreleaser.com/) to package the Python application and YANG models into a deployable Debian package (`.deb`).
 
-1. Ensure you have Docker installed (used to run `nfpm` via the `Makefile`).
-2. Run `make package` from the root of the repository.
+1. Run the unit test suite:
+   ```bash
+   make test
+   ```
+2. Ensure you have Docker installed (used to run `nfpm` via the `Makefile`).
+3. Run `make package` from the root of the repository.
 
-This will generate a `vlan-groups.deb` file in the project root.
+This will generate `vlan-groups_0.1.0_amd64.deb` in the project root.
 
 ## Testing locally with Containerlab
 
@@ -79,8 +83,8 @@ A test topology is provided in the `lab/` directory to quickly spin up a test en
 
 2. **Install the package:**
    ```bash
-   docker cp vlan-groups.deb clab-srl-vlan-groups-srl:/tmp/
-   docker exec clab-srl-vlan-groups-srl apt-get install -y /tmp/vlan-groups.deb
+   docker cp vlan-groups_0.1.0_amd64.deb clab-srl-vlan-groups-srl:/tmp/
+   docker exec clab-srl-vlan-groups-srl apt-get install -y /tmp/vlan-groups_0.1.0_amd64.deb
    ```
 
 3. **Log in to SR Linux:**
@@ -90,7 +94,7 @@ A test topology is provided in the `lab/` directory to quickly spin up a test en
    ```
 
 4. **Reload the Application Manager:**
-   Because we installed a new YANG schema and application, we need to instruct the Application Manager to parse the new configuration from within the CLI:
+   The package `postinstall` script automatically reloads `app_mgr`. You can also manually reload it from within the CLI if needed:
    ```text
    --{ + running }--[  ]--
    A:srl# tools system app-management application app_mgr reload
