@@ -152,10 +152,24 @@ except ImportError:
                 self.delete = _GnmiDeleteList()
                 self.update = _GnmiUpdateList()
 
+        class _GnmiGetRequest:
+            CONFIG = 1
+
+            def __init__(self):
+                self.path = _GnmiDeleteList()
+                self.type = 0
+                self.encoding = 0
+
+        class _GnmiEncoding:
+            JSON = 0
+            JSON_IETF = 4
+
         class gnmi_pb2:
             Path = _GnmiPath
             PathElem = _GnmiPathElem
             SetRequest = _GnmiSetRequest
+            GetRequest = _GnmiGetRequest
+            Encoding = _GnmiEncoding
 
         gnmi_pb2_grpc = None
 
@@ -335,26 +349,30 @@ class VlanGroupsApp:
     def process_notifications(self, stream_id):
         req = sdk_service_pb2.NotificationStreamRequest(stream_id=stream_id)
         logger.info(f"Starting to listen on NotificationStream for stream {stream_id}")
+        pending_reconcile = False
         try:
             for res in self.notification_stub.NotificationStream(req, metadata=self.sdk_metadata):
                 if not self._running:
                     break
                 logger.info("Raw notification stream response received")
 
-                has_config = False
+                commit_end = False
                 if res.notifications:
                     logger.info(f"Received notification response with {len(res.notifications)} notifications")
                     for notif in res.notifications:
                         if notif.HasField('config'):
-                            if self.handle_config_notification(notif.config):
-                                has_config = True
+                            if notif.config.key.js_path == '.commit.end':
+                                commit_end = True
+                            elif self.handle_config_notification(notif.config):
+                                pending_reconcile = True
 
                 # Ack the config when we receive a stream response
                 ack_req = config_service_pb2.AcknowledgeConfigRequest()
                 self.config_stub.AcknowledgeConfig(ack_req, metadata=self.sdk_metadata)
                 logger.info("Acknowledged config successfully!")
 
-                if has_config:
+                if commit_end and pending_reconcile:
+                    pending_reconcile = False
                     self.reconcile()
         except Exception as e:
             if self._running:
@@ -712,6 +730,26 @@ class VlanGroupsApp:
             [u for u in updates if not u["path"].endswith("/vlan-tagging")]
         )
 
+        # Inspect Running datastore via gNMI Get to skip redundant updates/deletes already committed by CLI
+        running_ifs, running_nis = self._fetch_running_targets(tagging_updates, other_updates, deletes)
+        if any(self._is_if_stale_against_running(if_name, running_ifs) for if_name in running_ifs):
+            tagging_updates = []
+            other_updates = []
+            deletes = []
+        else:
+            tagging_updates = [
+                u for u in tagging_updates
+                if not self._is_update_in_running(u, running_ifs, running_nis)
+            ]
+            other_updates = [
+                u for u in other_updates
+                if not self._is_update_in_running(u, running_ifs, running_nis)
+            ]
+            deletes = [
+                d for d in deletes
+                if self._is_delete_needed_in_running(d, running_ifs, running_nis, desired_encaps)
+            ]
+
         gnmi_ok = True
         # Step 1: Enable vlan-tagging on target interfaces first
         if tagging_updates:
@@ -881,6 +919,365 @@ class VlanGroupsApp:
             return [self._clean_ndk_json(item) for item in data]
         else:
             return data
+
+    @classmethod
+    def _normalize_gnmi_json(cls, data):
+        if isinstance(data, dict):
+            if 'value' in data and len(data) == 1:
+                return cls._normalize_gnmi_json(data['value'])
+            out = {}
+            for k, v in data.items():
+                clean_k = k.split(':', 1)[-1].replace('_', '-')
+                out[clean_k] = cls._normalize_gnmi_json(v)
+            return out
+        if isinstance(data, list):
+            return [cls._normalize_gnmi_json(item) for item in data]
+        if isinstance(data, str) and data.startswith('srl_nokia-'):
+            return data.split(':', 1)[-1]
+        return data
+
+    @staticmethod
+    def _unwrap_gnmi_root(data, root_key):
+        if not isinstance(data, dict):
+            return None
+        if root_key in data:
+            inner = data[root_key]
+            if isinstance(inner, list):
+                return inner[0] if inner else {}
+            if isinstance(inner, dict):
+                merged = dict(data)
+                merged.pop(root_key, None)
+                merged.update(inner)
+                return merged
+        return data
+
+    def _get_gnmi_json(self, path_str):
+        """Query Running configuration at path_str via gNMI Get.
+
+        Returns:
+          - dict: normalized JSON dict if path exists in Running
+          - {}: if gNMI Get succeeded (or NOT_FOUND) and path is absent in Running
+          - None: if gNMI Get is unavailable or unmocked (e.g., default MagicMock in unit tests)
+        """
+        try:
+            if self.gnmi_stub is None:
+                if grpc is None or gnmi_pb2_grpc is None:
+                    return None
+                self.gnmi_channel = grpc.insecure_channel(self.gnmi_socket)
+                self.gnmi_stub = gnmi_pb2_grpc.gNMIStub(self.gnmi_channel)
+
+            req = gnmi_pb2.GetRequest()
+            p = req.path.add()
+            p.CopyFrom(_parse_gnmi_path(path_str))
+            if hasattr(gnmi_pb2.GetRequest, 'CONFIG'):
+                req.type = gnmi_pb2.GetRequest.CONFIG
+            if hasattr(gnmi_pb2, 'Encoding') and hasattr(gnmi_pb2.Encoding, 'JSON_IETF'):
+                req.encoding = gnmi_pb2.Encoding.JSON_IETF
+
+            res = self.gnmi_stub.Get(
+                req,
+                metadata=[("username", self.gnmi_user), ("password", self.gnmi_password)]
+            )
+            if res is None or type(res).__name__ == 'MagicMock':
+                return None
+
+            notifications = getattr(res, 'notification', None)
+            if notifications is None or type(notifications).__name__ == 'MagicMock':
+                return None
+
+            for notif in notifications:
+                for upd in getattr(notif, 'update', []):
+                    val = getattr(upd, 'val', None)
+                    if val is None:
+                        continue
+                    raw_bytes = getattr(val, 'json_ietf_val', b'') or getattr(val, 'json_val', b'')
+                    if raw_bytes:
+                        if isinstance(raw_bytes, bytes):
+                            raw_bytes = raw_bytes.decode('utf-8')
+                        parsed = json.loads(raw_bytes)
+                        return self._normalize_gnmi_json(parsed)
+            return {}
+        except Exception as e:
+            err_str = str(e)
+            if 'NOT_FOUND' in err_str or 'not found' in err_str.lower():
+                return {}
+            return None
+
+    def _get_gnmi_json_batch(self, path_strs):
+        if not path_strs:
+            return {}
+        if "_get_gnmi_json" in self.__dict__:
+            return {p: self._get_gnmi_json(p) for p in path_strs}
+        try:
+            if self.gnmi_stub is None:
+                if grpc is None or gnmi_pb2_grpc is None:
+                    return {p: None for p in path_strs}
+                self.gnmi_channel = grpc.insecure_channel(self.gnmi_socket)
+                self.gnmi_stub = gnmi_pb2_grpc.gNMIStub(self.gnmi_channel)
+
+            req = gnmi_pb2.GetRequest()
+            for p_str in path_strs:
+                p = req.path.add()
+                p.CopyFrom(_parse_gnmi_path(p_str))
+            if hasattr(gnmi_pb2.GetRequest, 'CONFIG'):
+                req.type = gnmi_pb2.GetRequest.CONFIG
+            if hasattr(gnmi_pb2, 'Encoding') and hasattr(gnmi_pb2.Encoding, 'JSON_IETF'):
+                req.encoding = gnmi_pb2.Encoding.JSON_IETF
+
+            res = self.gnmi_stub.Get(
+                req,
+                metadata=[("username", self.gnmi_user), ("password", self.gnmi_password)]
+            )
+            if res is None or type(res).__name__ == 'MagicMock':
+                return {p: None for p in path_strs}
+
+            notifications = getattr(res, 'notification', None)
+            if notifications is None or type(notifications).__name__ == 'MagicMock':
+                return {p: None for p in path_strs}
+
+            notif_list = list(notifications)
+            if len(notif_list) == len(path_strs):
+                out = {}
+                for p_str, notif in zip(path_strs, notif_list):
+                    parsed_val = {}
+                    for upd in getattr(notif, 'update', []):
+                        val = getattr(upd, 'val', None)
+                        if val is None:
+                            continue
+                        raw_bytes = getattr(val, 'json_ietf_val', b'') or getattr(val, 'json_val', b'')
+                        if raw_bytes:
+                            if isinstance(raw_bytes, bytes):
+                                raw_bytes = raw_bytes.decode('utf-8')
+                            parsed_val = self._normalize_gnmi_json(json.loads(raw_bytes))
+                            break
+                    out[p_str] = parsed_val
+                return out
+        except Exception:
+            pass
+        return {p: self._get_gnmi_json(p) for p in path_strs}
+
+    def _fetch_running_targets(self, tagging_updates, other_updates, deletes):
+        if_names = set()
+        ni_names = set()
+
+        all_paths = [u["path"] for u in tagging_updates] + [u["path"] for u in other_updates] + list(deletes)
+        for p in all_paths:
+            if_m = re.match(r"^/interface\[name=([^\]]+)\]", p)
+            if if_m:
+                if_names.add(if_m.group(1))
+                continue
+            ni_m = re.match(r"^/network-instance\[name=([^\]]+)\]", p)
+            if ni_m:
+                ni_names.add(ni_m.group(1))
+
+        sorted_ifs = sorted(if_names)
+        sorted_nis = sorted(ni_names)
+        if_paths = [f"/interface[name={if_name}]" for if_name in sorted_ifs]
+        ni_paths = [f"/network-instance[name={ni_name}]" for ni_name in sorted_nis]
+        batch_res = self._get_gnmi_json_batch(if_paths + ni_paths)
+
+        running_ifs = {}
+        for if_name in sorted_ifs:
+            raw = batch_res.get(f"/interface[name={if_name}]")
+            running_ifs[if_name] = self._unwrap_gnmi_root(raw, "interface") if raw is not None else None
+
+        running_nis = {}
+        for ni_name in sorted_nis:
+            raw = batch_res.get(f"/network-instance[name={ni_name}]")
+            running_nis[ni_name] = self._unwrap_gnmi_root(raw, "network-instance") if raw is not None else None
+
+        return running_ifs, running_nis
+
+    def _is_if_stale_against_running(self, if_name, running_ifs):
+        if "_get_gnmi_json" in self.__dict__:
+            return False
+        if_data = running_ifs.get(if_name)
+        if not isinstance(if_data, dict):
+            return False
+        vgs_c = if_data.get("vlan-groups", {})
+        vg_list = vgs_c.get("vlan-group", []) if isinstance(vgs_c, dict) else []
+        if isinstance(vg_list, dict):
+            vg_list = [vg_list]
+        run_vgs = sorted(str(x.get("name")) for x in vg_list if isinstance(x, dict) and x.get("name"))
+        ndk_vgs = sorted(
+            str(x.get("name")) for x in self.interfaces.get(if_name, {}).get("vlan-group", [])
+            if isinstance(x, dict) and x.get("name")
+        )
+        return run_vgs != ndk_vgs
+
+    @staticmethod
+    def _find_running_sub(if_data, sid):
+        if not isinstance(if_data, dict):
+            return None
+        subs = if_data.get("subinterface", [])
+        if isinstance(subs, dict):
+            subs = [subs]
+        for s in subs:
+            if isinstance(s, dict) and str(s.get("index")) == str(sid):
+                return s
+        return None
+
+    @staticmethod
+    def _encap_matches_running(sub_dict, desired_encap_dict):
+        if not isinstance(sub_dict, dict) or not isinstance(desired_encap_dict, dict):
+            return False
+        vlan = sub_dict.get("vlan", {})
+        if not isinstance(vlan, dict):
+            return False
+        encap = vlan.get("encap", {})
+        if not isinstance(encap, dict):
+            return False
+        if "untagged" in desired_encap_dict:
+            return "untagged" in encap and "single-tagged" not in encap
+        if "single-tagged" in desired_encap_dict:
+            want_vid = desired_encap_dict["single-tagged"].get("vlan-id")
+            st = encap.get("single-tagged", {})
+            if not isinstance(st, dict):
+                return False
+            return str(st.get("vlan-id")) == str(want_vid)
+        return False
+
+    def _is_update_in_running(self, update, running_ifs, running_nis):
+        path = update["path"]
+        val = update["value"]
+
+        vt_m = re.match(r"^/interface\[name=([^\]]+)\]/vlan-tagging$", path)
+        if vt_m:
+            if_data = running_ifs.get(vt_m.group(1))
+            if if_data is None:
+                return False
+            return if_data.get("vlan-tagging") is val
+
+        sub_m = re.match(r"^/interface\[name=([^\]]+)\]/subinterface\[index=([^\]]+)\]$", path)
+        if sub_m:
+            if_name = sub_m.group(1)
+            sid_str = sub_m.group(2)
+            sid_key = int(sid_str) if sid_str.isdigit() else sid_str
+            if_data = running_ifs.get(if_name)
+            if if_data is None:
+                return False
+            sub = self._find_running_sub(if_data, sid_str)
+            if sub is None:
+                return False
+            desired_encap = val.get("vlan", {}).get("encap", {})
+            if sub.get("type") == val.get("type") and self._encap_matches_running(sub, desired_encap):
+                return True
+            # If subinterface already exists in Running with a manual conflict/override not deployed by VlanGroupsApp, do not overwrite it
+            old_encap = self.deployed_encaps.get(if_name, {}).get(sid_key)
+            if old_encap is not None:
+                old_encap_dict = (
+                    {"untagged": {}} if old_encap == "untagged"
+                    else {"single-tagged": {"vlan-id": old_encap[1]}}
+                )
+                if sub.get("type") == "bridged" and self._encap_matches_running(sub, old_encap_dict):
+                    return False
+            if sub.get("type") not in (None, "bridged") or "vlan" in sub or "ipv4" in sub or "ipv6" in sub:
+                return True
+            return False
+
+        ni_m = re.match(r"^/network-instance\[name=([^\]]+)\]$", path)
+        if ni_m:
+            ni_data = running_nis.get(ni_m.group(1))
+            if ni_data is None:
+                return False
+            return ni_data.get("type") == val.get("type")
+
+        ni_if_m = re.match(r"^/network-instance\[name=([^\]]+)\]/interface\[name=([^\]]+)\]$", path)
+        if ni_if_m:
+            ni_data = running_nis.get(ni_if_m.group(1))
+            if ni_data is None:
+                return False
+            if_sub = ni_if_m.group(2)
+            if "." in if_sub:
+                if_name, sid_str = if_sub.rsplit(".", 1)
+                if_data = running_ifs.get(if_name)
+                if if_data is not None:
+                    sub = self._find_running_sub(if_data, sid_str)
+                    if sub is not None and sub.get("type") not in (None, "bridged"):
+                        return True
+            ni_ifs = ni_data.get("interface", [])
+            if isinstance(ni_ifs, dict):
+                ni_ifs = [ni_ifs]
+            return any(isinstance(x, dict) and str(x.get("name")) == if_sub for x in ni_ifs)
+
+        return False
+
+    def _is_delete_needed_in_running(self, delete_path, running_ifs, running_nis, desired_encaps):
+        ni_if_m = re.match(r"^/network-instance\[name=([^\]]+)\]/interface\[name=([^\]]+)\]$", delete_path)
+        if ni_if_m:
+            ni_data = running_nis.get(ni_if_m.group(1))
+            if ni_data is None:
+                return True
+            if not ni_data:
+                return False
+            ni_ifs = ni_data.get("interface", [])
+            if isinstance(ni_ifs, dict):
+                ni_ifs = [ni_ifs]
+            return any(isinstance(x, dict) and str(x.get("name")) == ni_if_m.group(2) for x in ni_ifs)
+
+        sub_m = re.match(r"^/interface\[name=([^\]]+)\]/subinterface\[index=([^\]]+)\]$", delete_path)
+        if sub_m:
+            if_name = sub_m.group(1)
+            sid_str = sub_m.group(2)
+            sid_key = int(sid_str) if sid_str.isdigit() else sid_str
+            if_data = running_ifs.get(if_name)
+            if if_data is None:
+                return True
+            if not if_data:
+                return False
+            sub = self._find_running_sub(if_data, sid_str)
+            if sub is None:
+                return False
+
+            # Preserve subinterface if it has user-configured attributes or custom/stripped encap
+            extra_keys = set(sub.keys()) - {"index", "type", "vlan"}
+            if extra_keys or "vlan" not in sub:
+                return False
+            old_encap = self.deployed_encaps.get(if_name, {}).get(sid_key)
+            if old_encap is not None:
+                old_encap_dict = (
+                    {"untagged": {}} if old_encap == "untagged"
+                    else {"single-tagged": {"vlan-id": old_encap[1]}}
+                )
+                if not self._encap_matches_running(sub, old_encap_dict):
+                    return False
+
+            # If CLI commit already unbound <if_name>.<sid> from its MAC-VRF in Running while keeping the subinterface,
+            # the subinterface was intentionally preserved as user-owned by the CLI observer.
+            if_sub_name = f"{if_name}.{sid_str}"
+            for vg_sub_map in self.deployed_subs.get(if_name, {}).values():
+                old_mvrf = vg_sub_map.get(sid_key, vg_sub_map.get(sid_str))
+                if old_mvrf and running_nis.get(old_mvrf) is not None:
+                    ni_ifs = running_nis[old_mvrf].get("interface", [])
+                    if isinstance(ni_ifs, dict):
+                        ni_ifs = [ni_ifs]
+                    still_bound = any(isinstance(x, dict) and str(x.get("name")) == if_sub_name for x in ni_ifs)
+                    if not still_bound:
+                        return False
+            return True
+
+        encap_m = re.match(r"^/interface\[name=([^\]]+)\]/subinterface\[index=([^\]]+)\]/vlan/encap$", delete_path)
+        if encap_m:
+            if_name = encap_m.group(1)
+            sid_str = encap_m.group(2)
+            sid_key = int(sid_str) if sid_str.isdigit() else sid_str
+            if_data = running_ifs.get(if_name)
+            if if_data is None:
+                return True
+            sub = self._find_running_sub(if_data, sid_str)
+            if sub is None:
+                return False
+            new_encap = desired_encaps.get(if_name, {}).get(sid_key)
+            if new_encap is not None:
+                new_encap_dict = (
+                    {"untagged": {}} if new_encap == "untagged"
+                    else {"single-tagged": {"vlan-id": new_encap[1]}}
+                )
+                if self._encap_matches_running(sub, new_encap_dict):
+                    return False
+            return True
+
+        return True
 
     def _apply_gnmi(self, updates, deletes=None):
         if not updates and not deletes:
